@@ -1346,6 +1346,8 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// Direct D3D12 buffer states tracked in this recording ([`buffers`]).
+    buffer_states: Mutex<buffers::BufferStates>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -3892,6 +3894,7 @@ fn late_line(frames: f64) {
 
 pub(crate) mod aside;
 pub(crate) mod awake;
+mod buffers;
 mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
@@ -4311,6 +4314,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                buffer_states: Mutex::default(),
                 prelude,
                 pipelines,
                 #[cfg(feature = "diagnostics")]
@@ -4458,7 +4462,13 @@ impl Host {
     /// `relay`).
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
-    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+    fn card_before(
+        &self,
+        declared: &[Declared],
+        picked: &crate::picked::Ranges,
+        flown: bool,
+        live_buffers: &buffers::LiveBuffers,
+    ) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -4709,8 +4719,9 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    // What the submission's shaders wrote, first.
-                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    // What the submission's shaders wrote, first, plus any
+                    // transition needed for buffers left out of a read state.
+                    let mut pre = vec![D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                         Anonymous: D3D12_RESOURCE_BARRIER_0 {
@@ -4718,7 +4729,9 @@ impl Host {
                                 pResource: std::mem::ManuallyDrop::new(None),
                             }),
                         },
-                    }]);
+                    }];
+                    pre.extend(buffers::check_barriers(live_buffers, &plan.ranges));
+                    list.ResourceBarrier(&pre);
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
@@ -5873,11 +5886,19 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
-        #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unused_enumerate_index))]
-        for (_run, list) in runs.iter().enumerate() {
+        #[cfg(feature = "diagnostics")]
+        let split_each = !late && timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let split_each = false;
+        let mut live_buffers = buffers::LiveBuffers::new();
+        for (run, list) in runs.iter().enumerate() {
+            if split_each || (late && parts.contains(&run)) {
+                live_buffers.clear();
+            }
             let uploads = list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+            let buffer_barriers = list.prelude_buffer_barriers(&mut live_buffers);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude(&uploads) {
+            if let Some(prelude) = list.prelude(&uploads, &buffer_barriers) {
                 #[cfg(feature = "diagnostics")]
                 marks.push((lists.len(), crate::copystat::Timed::Prelude));
                 lists.push(Some(prelude));
@@ -5887,7 +5908,7 @@ impl Host {
                 lists.len(),
                 match &own {
                     Some(own) if std::ptr::eq(own.list(), *list) => crate::copystat::Timed::Steps,
-                    _ => crate::copystat::Timed::Title(_run),
+                    _ => crate::copystat::Timed::Title(run),
                 },
             ));
             lists.push(list.list.cast().ok());
@@ -5928,7 +5949,10 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        if split_each {
+            live_buffers.clear();
+        }
+        let card = self.card_before(&declared, &picked, flown, &live_buffers);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -6601,6 +6625,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.buffer_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6914,7 +6939,11 @@ impl HostList {
     /// from the other, if a list submitted earlier left it behind. For
     /// title-written textures refreshed on this submission (`uploads`), it
     /// records `CopyTextureRegion` right before the list runs.
-    fn prelude(&self, uploads: &[(crate::texture::PreludeUpload, bool)]) -> Option<ID3D12CommandList> {
+    fn prelude(
+        &self,
+        uploads: &[(crate::texture::PreludeUpload, bool)],
+        buffer_barriers: &[D3D12_RESOURCE_BARRIER],
+    ) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -7013,6 +7042,7 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
+        barriers.extend_from_slice(buffer_barriers);
         if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
@@ -7117,6 +7147,7 @@ impl HostList {
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && self.buffer_states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Notes an indirect execution, while device-removed data is kept
